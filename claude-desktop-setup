@@ -548,7 +548,7 @@ paso_10_integracion_escritorio() {
       *)
         local fichero_perfil="${HOME}/.profile"
         # Hay que reconocer las DOS formas de escribir el mismo directorio: la
-        # expandida (/home/jason/.local/bin) y la que usa $HOME sin expandir.
+        # expandida y la que usa $HOME sin expandir.
         # Buscar solo una de ellas duplica la línea en el perfil de quien ya
         # tenía la otra.
         local ruta_expandida="${PREFIJO}/bin"
