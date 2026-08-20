@@ -1,0 +1,733 @@
+#!/usr/bin/env bash
+#
+# claude-desktop-setup — instala o actualiza Claude Desktop en distros NO Debian
+# ==============================================================================
+#
+# El instalador oficial de Claude Desktop solo soporta Ubuntu 22.04+ / Debian 12+
+# vía repositorio apt. En Arch, Garuda, Manjaro, EndeavourOS, Fedora, openSUSE o
+# cualquier cosa sin apt, ese camino no existe.
+#
+# Este script hace exactamente lo que haría apt, pero a mano: descarga el .deb
+# oficial del repositorio de Anthropic verificando la cadena de confianza
+# completa, y lo instala con integración de escritorio nativa.
+#
+#     clave GPG (huella fijada)
+#         └─> InRelease firmado por Anthropic
+#                 └─> hash de Packages declarado en el índice
+#                         └─> hash del .deb declarado en Packages
+#
+# Si un solo eslabón falla, el script para y no instala nada.
+#
+# NO ejecuta el postinst del paquete, a propósito: ese script registra el repo
+# apt (inútil sin apt) y escribe un perfil AppArmor que solo hace falta en
+# Ubuntu 24.04+, donde el kernel restringe los namespaces de usuario.
+#
+# Es idempotente: re-ejecutarlo actualiza a la última versión, o no hace nada si
+# ya estás al día. Sirve igual para instalar la primera vez que para actualizar.
+#
+# USO
+#   claude-desktop-setup                 instala/actualiza en ~/.local (sin root)
+#   claude-desktop-setup --system        instala en /opt (pide sudo, para todos
+#                                        los usuarios; requiere terminal real)
+#   claude-desktop-setup --check         solo informa si hay versión nueva
+#   claude-desktop-setup --force         reinstala aunque ya esté al día
+#   claude-desktop-setup --prefix DIR    prefijo propio en lugar de ~/.local
+#   claude-desktop-setup --launch        abre la app al terminar
+#   claude-desktop-setup --uninstall     desinstala lo que instaló este script
+#
+# ==============================================================================
+
+set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# Constantes  (REGLA: cero valores mágicos repartidos por el código)
+# ------------------------------------------------------------------------------
+readonly REPO_BASE="https://downloads.claude.ai/claude-desktop/apt/stable"
+readonly SIGNING_KEY_URL="https://downloads.claude.ai/claude-desktop/key.asc"
+
+# Huella de "Anthropic Claude Code Release Signing <security@anthropic.com>",
+# la misma que publica la documentación oficial. Fijarla aquí es lo que hace
+# que el script detecte un repositorio suplantado: si sirviera otra clave,
+# aunque la firma del índice cuadrase con ella, el script para en seco.
+readonly EXPECTED_FINGERPRINT="31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
+
+readonly DEBIAN_SUITE="stable"
+readonly DEBIAN_COMPONENT="main"
+readonly PAQUETE="claude-desktop"
+readonly ARCHIVO_STAMP=".package-version"
+readonly DESKTOP_FILE="com.anthropic.Claude.desktop"
+readonly TAMANOS_ICONO=(16 32 48 128 256)
+readonly HERRAMIENTAS_REQUERIDAS=(curl gpg gpgv bsdtar sha256sum awk sed find)
+
+# Rutas del modo sistema (--system). En modo usuario se derivan del prefijo.
+readonly APP_DIR_SISTEMA="/opt/claude-desktop"
+readonly PREFIJO_SISTEMA="/usr/local"
+
+# ------------------------------------------------------------------------------
+# Presentación
+# ------------------------------------------------------------------------------
+if [ -t 1 ]; then
+  readonly C_PASO=$'\033[1;36m'; readonly C_OK=$'\033[1;32m'
+  readonly C_AVISO=$'\033[1;33m'; readonly C_ERROR=$'\033[1;31m'
+  readonly C_TENUE=$'\033[2m';    readonly C_FIN=$'\033[0m'
+else
+  readonly C_PASO=""; readonly C_OK=""; readonly C_AVISO=""
+  readonly C_ERROR=""; readonly C_TENUE=""; readonly C_FIN=""
+fi
+
+numero_de_paso=0
+paso() {
+  numero_de_paso=$((numero_de_paso + 1))
+  printf '\n%s┌─ PASO %d — %s%s\n' "$C_PASO" "$numero_de_paso" "$1" "$C_FIN"
+}
+ok()      { printf '   %s✓%s %s\n' "$C_OK" "$C_FIN" "$*"; }
+aviso()   { printf '   %s!%s %s\n' "$C_AVISO" "$C_FIN" "$*"; }
+detalle() { printf '     %s%s%s\n' "$C_TENUE" "$*" "$C_FIN"; }
+fatal()   { printf '\n%s✗ ABORTADO%s %s\n' "$C_ERROR" "$C_FIN" "$*" >&2; exit 1; }
+
+# El relleno de printf ('%-22s') cuenta BYTES, así que una etiqueta con tilde
+# ocupa un byte más y sale un espacio corta. ${#cadena} de bash sí cuenta
+# caracteres en locale UTF-8, así que calculo el relleno a mano.
+readonly ANCHO_ETIQUETA_RESUMEN=20
+fila_resumen() {
+  local etiqueta="$1" valor="$2" relleno
+  relleno=$(( ANCHO_ETIQUETA_RESUMEN - ${#etiqueta} ))
+  [ "$relleno" -lt 1 ] && relleno=1
+  printf '   %s%*s%s\n' "$etiqueta" "$relleno" "" "$valor"
+}
+
+# ------------------------------------------------------------------------------
+# Argumentos
+# ------------------------------------------------------------------------------
+modo_sistema=false
+solo_comprobar=false
+reinstalar_igual=false
+abrir_al_terminar=false
+desinstalar=false
+prefijo_usuario="${HOME}/.local"
+prefijo_personalizado=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --system)    modo_sistema=true ;;
+    --check)     solo_comprobar=true ;;
+    --force)     reinstalar_igual=true ;;
+    --launch)    abrir_al_terminar=true ;;
+    --uninstall) desinstalar=true ;;
+    --prefix)
+      [ $# -ge 2 ] || fatal "--prefix necesita un directorio"
+      prefijo_usuario="$2"; prefijo_personalizado=true; shift ;;
+    -h|--help)   sed -n '/^# USO/,/^# ===/p' "$0" | sed 's/^# \{0,1\}//;$d'; exit 0 ;;
+    *)           fatal "argumento no reconocido: $1 (usa --help)" ;;
+  esac
+  shift
+done
+
+# Rutas efectivas según el modo elegido.
+if [ "$modo_sistema" = true ]; then
+  APP_DIR="$APP_DIR_SISTEMA"
+  PREFIJO="$PREFIJO_SISTEMA"
+  privilegiado() { sudo "$@"; }
+else
+  APP_DIR="${prefijo_usuario}/lib/claude-desktop"
+  PREFIJO="$prefijo_usuario"
+  privilegiado() { "$@"; }
+fi
+readonly APP_DIR PREFIJO
+readonly LAUNCHER="${PREFIJO}/bin/claude-desktop"
+readonly DIR_DESKTOP="${PREFIJO}/share/applications"
+readonly DIR_ICONOS="${PREFIJO}/share/icons/hicolor"
+readonly RUTA_STAMP="${APP_DIR}/${ARCHIVO_STAMP}"
+
+# ==============================================================================
+# PASO 1 — Comprobaciones previas
+# ==============================================================================
+paso_1_comprobaciones() {
+  paso "Comprobaciones previas"
+
+  local herramienta faltantes=()
+  for herramienta in "${HERRAMIENTAS_REQUERIDAS[@]}"; do
+    command -v "$herramienta" >/dev/null || faltantes+=("$herramienta")
+  done
+  [ ${#faltantes[@]} -eq 0 ] \
+    || fatal "faltan herramientas: ${faltantes[*]} (en Arch: pacman -S curl gnupg libarchive)"
+  ok "Herramientas necesarias presentes"
+
+  # Traducción de la arquitectura del kernel al nombre que usa Debian. El repo
+  # solo publica estas dos; en cualquier otra no hay nada que descargar.
+  local arquitectura_kernel
+  arquitectura_kernel="$(uname -m)"
+  case "$arquitectura_kernel" in
+    x86_64)  ARQUITECTURA_DEBIAN="amd64" ;;
+    aarch64) ARQUITECTURA_DEBIAN="arm64" ;;
+    *) fatal "arquitectura no soportada por el repositorio: $arquitectura_kernel (solo x86_64 y aarch64)" ;;
+  esac
+  readonly ARQUITECTURA_DEBIAN
+  readonly RUTA_INDICE_PACKAGES="${DEBIAN_COMPONENT}/binary-${ARQUITECTURA_DEBIAN}/Packages"
+  ok "Arquitectura: $arquitectura_kernel → $ARQUITECTURA_DEBIAN"
+
+  if command -v apt-get >/dev/null; then
+    aviso "Este sistema TIENE apt. Te conviene más el método oficial:"
+    detalle "https://code.claude.com/docs/en/desktop-linux"
+    detalle "Ese camino te da actualizaciones con 'apt upgrade'. Sigo de todas formas."
+  fi
+
+  if [ "$modo_sistema" = true ]; then
+    command -v sudo >/dev/null || fatal "--system necesita sudo"
+    # sudo sin TTY no puede pedir contraseña y falla a mitad de la instalación,
+    # dejándola incompleta. Mejor comprobarlo aquí que a medio camino.
+    sudo -n true 2>/dev/null \
+      || sudo -v 2>/dev/null \
+      || fatal "sudo no puede pedir contraseña aquí. Ejecuta --system desde una terminal real."
+    ok "Modo sistema: privilegios disponibles"
+  else
+    ok "Modo usuario: sin root, todo bajo $PREFIJO"
+  fi
+}
+
+# ==============================================================================
+# PASO 2 — Clave de firma de Anthropic, con huella verificada
+# ==============================================================================
+paso_2_clave_de_firma() {
+  paso "Clave de firma de Anthropic"
+
+  curl -fsSLo clave.asc "$SIGNING_KEY_URL" \
+    || fatal "no se pudo descargar la clave desde $SIGNING_KEY_URL"
+
+  local huella_obtenida
+  huella_obtenida="$(gpg --show-keys --with-colons clave.asc 2>/dev/null \
+    | awk -F: '/^fpr:/ {print $10; exit}')"
+  [ -n "$huella_obtenida" ] || fatal "el fichero descargado no es una clave OpenPGP válida"
+  [ "$huella_obtenida" = "$EXPECTED_FINGERPRINT" ] \
+    || fatal "HUELLA DISTINTA A LA ESPERADA
+     obtenida: $huella_obtenida
+     esperada: $EXPECTED_FINGERPRINT
+     No instalo nada. O el repositorio cambió de clave, o alguien está en medio."
+
+  ok "Huella verificada: $EXPECTED_FINGERPRINT"
+  detalle "Anthropic Claude Code Release Signing <security@anthropic.com>"
+  gpg --dearmor < clave.asc > llavero.gpg
+}
+
+# ==============================================================================
+# PASO 3 — Índice del repositorio, con firma verificada
+# ==============================================================================
+paso_3_indice_firmado() {
+  paso "Firma del índice del repositorio"
+
+  curl -fsSLo InRelease "${REPO_BASE}/dists/${DEBIAN_SUITE}/InRelease" \
+    || fatal "no se pudo descargar InRelease"
+
+  gpgv --keyring ./llavero.gpg InRelease >/dev/null 2>&1 \
+    || fatal "la firma del índice NO es válida — el repositorio no es de confianza"
+
+  ok "Índice firmado por Anthropic"
+  # Un 'X && Y' aquí sería un fallo latente: al ser la última sentencia de la
+  # función, si la condición fuese falsa la función devolvería 1 y con set -e
+  # el script moriría en silencio justo después de verificar la firma.
+  local fecha_firma
+  fecha_firma="$(awk '/^Date:/ {sub(/^Date: /, ""); print; exit}' InRelease)"
+  if [ -n "$fecha_firma" ]; then
+    detalle "Publicado: $fecha_firma"
+  fi
+}
+
+# ==============================================================================
+# PASO 4 — Lista de paquetes, con hash verificado contra el índice
+# ==============================================================================
+paso_4_lista_de_paquetes() {
+  paso "Integridad de la lista de paquetes"
+
+  # OJO con el patrón de fin de sección: tiene que incluir DÍGITOS.
+  # El InRelease trae las secciones SHA256: y SHA512: seguidas, y un patrón
+  # como /^[A-Za-z-]+:/ NO casa con "SHA512:" (los dígitos quedan fuera de la
+  # clase), así que la sección nunca se cierra y se leen también los hashes
+  # SHA512 como si fueran SHA256.
+  local hash_declarado
+  hash_declarado="$(awk -v ruta="$RUTA_INDICE_PACKAGES" '
+    /^SHA256:/          {dentro_de_seccion = 1; next}
+    /^[A-Za-z0-9-]+:/   {dentro_de_seccion = 0}
+    dentro_de_seccion && $3 == ruta {print $1; exit}
+  ' InRelease)"
+  [ -n "$hash_declarado" ] \
+    || fatal "el índice firmado no declara hash para $RUTA_INDICE_PACKAGES"
+
+  curl -fsSLo Packages "${REPO_BASE}/dists/${DEBIAN_SUITE}/${RUTA_INDICE_PACKAGES}" \
+    || fatal "no se pudo descargar la lista de paquetes"
+
+  local hash_calculado
+  hash_calculado="$(sha256sum Packages | cut -d' ' -f1)"
+  [ "$hash_declarado" = "$hash_calculado" ] \
+    || fatal "el hash de Packages no coincide con el índice firmado"
+
+  ok "Lista de paquetes íntegra"
+}
+
+# ==============================================================================
+# PASO 5 — Selección de versión
+# ==============================================================================
+paso_5_seleccionar_version() {
+  paso "Selección de versión"
+
+  # Cada registro de Packages va separado por una línea en blanco. Saco una
+  # línea "version<TAB>fichero<TAB>sha256" por registro y ordeno por versión
+  # con sort -V, que compara números como números (1.32885.1 > 1.9367.0, algo
+  # que un sort alfabético se equivocaría).
+  local registro_mas_nuevo
+  registro_mas_nuevo="$(awk '
+    BEGIN {RS = ""; FS = "\n"}
+    {
+      version = ""; fichero = ""; suma = ""
+      for (linea = 1; linea <= NF; linea++) {
+        if ($linea ~ /^Version: /)  {version = substr($linea, 10)}
+        if ($linea ~ /^Filename: /) {fichero = substr($linea, 11)}
+        if ($linea ~ /^SHA256: /)   {suma    = substr($linea, 9)}
+      }
+      if (version != "" && fichero != "" && suma != "") {
+        printf "%s\t%s\t%s\n", version, fichero, suma
+      }
+    }
+  ' Packages | sort -V -k1,1 | tail -n 1)"
+  [ -n "$registro_mas_nuevo" ] \
+    || fatal "el repositorio no publica ningún paquete para $ARQUITECTURA_DEBIAN"
+
+  VERSION_DISPONIBLE="$(cut -f1 <<< "$registro_mas_nuevo")"
+  RUTA_REMOTA_DEB="$(cut -f2  <<< "$registro_mas_nuevo")"
+  HASH_ESPERADO_DEB="$(cut -f3 <<< "$registro_mas_nuevo")"
+  readonly VERSION_DISPONIBLE RUTA_REMOTA_DEB HASH_ESPERADO_DEB
+
+  local version_instalada
+  version_instalada="$(cat "$RUTA_STAMP" 2>/dev/null || echo "ninguna")"
+
+  ok "Instalada: $version_instalada"
+  ok "Disponible: $VERSION_DISPONIBLE"
+
+  if [ "$solo_comprobar" = true ]; then
+    if [ "$version_instalada" = "$VERSION_DISPONIBLE" ]; then
+      printf '\n%s✓ Estás al día.%s\n' "$C_OK" "$C_FIN"
+    else
+      printf '\n%s! Hay versión nueva: %s%s\n' "$C_AVISO" "$VERSION_DISPONIBLE" "$C_FIN"
+    fi
+    exit 0
+  fi
+
+  if [ "$version_instalada" = "$VERSION_DISPONIBLE" ] && [ "$reinstalar_igual" = false ]; then
+    printf '\n%s✓ Ya estás al día. Usa --force para reinstalar.%s\n' "$C_OK" "$C_FIN"
+    exit 0
+  fi
+
+  # Sustituir los ficheros de una app abierta la deja en un estado raro: los
+  # procesos hijo que arranque después cargarán binarios de otra versión.
+  if pgrep -f "${APP_DIR}/claude-desktop" >/dev/null 2>&1; then
+    fatal "Claude Desktop está abierto. Ciérralo y vuelve a ejecutar."
+  fi
+}
+
+# ==============================================================================
+# PASO 6 — Descarga y verificación del paquete
+# ==============================================================================
+paso_6_descargar_paquete() {
+  paso "Descarga y verificación del paquete"
+
+  NOMBRE_DEB="$(basename "$RUTA_REMOTA_DEB")"
+  readonly NOMBRE_DEB
+  detalle "$NOMBRE_DEB"
+
+  if [ -t 1 ]; then
+    curl -fL# -o "$NOMBRE_DEB" "${REPO_BASE}/${RUTA_REMOTA_DEB}" \
+      || fatal "falló la descarga del paquete"
+  else
+    curl -fsSL -o "$NOMBRE_DEB" "${REPO_BASE}/${RUTA_REMOTA_DEB}" \
+      || fatal "falló la descarga del paquete"
+  fi
+
+  local hash_calculado
+  hash_calculado="$(sha256sum "$NOMBRE_DEB" | cut -d' ' -f1)"
+  [ "$HASH_ESPERADO_DEB" = "$hash_calculado" ] \
+    || fatal "el hash del .deb no coincide con el declarado en el índice firmado
+     esperado: $HASH_ESPERADO_DEB
+     obtenido: $hash_calculado"
+
+  ok "Paquete verificado de punta a punta"
+}
+
+# ==============================================================================
+# PASO 7 — Extracción
+# ==============================================================================
+paso_7_extraer() {
+  paso "Extracción"
+
+  mkdir -p extraido
+  # Un .deb es un archivo 'ar' con control.tar.* y data.tar.*. Solo necesito
+  # data (los ficheros); control lleva los maintainer scripts, que NO ejecuto.
+  bsdtar -xOf "$NOMBRE_DEB" 'data.tar*' | bsdtar -xf - -C extraido \
+    || fatal "no se pudo extraer data.tar del paquete"
+
+  ORIGEN="extraido/usr"
+  readonly ORIGEN
+  [ -d "${ORIGEN}/lib/claude-desktop" ] \
+    || fatal "el paquete no tiene la estructura esperada (falta usr/lib/claude-desktop)"
+
+  ok "Extraído ($(du -sh "${ORIGEN}/lib/claude-desktop" | cut -f1))"
+  detalle "Los maintainer scripts del .deb NO se ejecutan: registran el repo apt"
+  detalle "y un perfil AppArmor que solo aplican en Debian/Ubuntu."
+}
+
+# ==============================================================================
+# PASO 8 — Dependencias de bibliotecas
+# ==============================================================================
+paso_8_comprobar_dependencias() {
+  paso "Dependencias de bibliotecas"
+
+  # ldd sobre los binarios reales es la fuente de verdad: dice qué falta de
+  # verdad en ESTE sistema, en vez de traducir a mano los nombres de paquete
+  # Debian a sus equivalentes de otra distro.
+  local directorio_binarios="${ORIGEN}/lib/claude-desktop"
+  local bibliotecas_faltantes=()
+  local binario nombre_biblioteca
+
+  while IFS= read -r binario; do
+    while IFS= read -r nombre_biblioteca; do
+      if [ -n "$nombre_biblioteca" ]; then
+        bibliotecas_faltantes+=("$nombre_biblioteca")
+      fi
+    done < <(ldd "$binario" 2>/dev/null | awk '/not found/ {print $1}')
+  done < <(find "$directorio_binarios" -maxdepth 1 -type f \
+             \( -name 'claude-desktop' -o -name 'chrome*' -o -name 'lib*.so*' \))
+
+  if [ ${#bibliotecas_faltantes[@]} -eq 0 ]; then
+    ok "Todas las bibliotecas dinámicas resuelven en este sistema"
+    return 0
+  fi
+
+  local lista_unica
+  lista_unica="$(printf '%s\n' "${bibliotecas_faltantes[@]}" | sort -u)"
+  aviso "Faltan bibliotecas — la app no arrancará hasta instalarlas:"
+  printf '%s\n' "$lista_unica" | while IFS= read -r nombre_biblioteca; do
+    local paquete_sugerido=""
+    # pacman -F busca qué paquete contiene un fichero. Necesita la base de
+    # datos de ficheros sincronizada (pacman -Fy); si no está, no sugiere nada.
+    if command -v pacman >/dev/null; then
+      paquete_sugerido="$(pacman -Fq "$nombre_biblioteca" 2>/dev/null | head -1 || true)"
+    fi
+    if [ -n "$paquete_sugerido" ]; then
+      detalle "$nombre_biblioteca  →  $paquete_sugerido"
+    else
+      detalle "$nombre_biblioteca"
+    fi
+  done
+  if command -v pacman >/dev/null; then
+    detalle "(si no ves sugerencias, sincroniza la base de ficheros: pacman -Fy)"
+  fi
+  fatal "instala esas bibliotecas y vuelve a ejecutar"
+}
+
+# ==============================================================================
+# PASO 9 — Instalación de ficheros
+# ==============================================================================
+sandbox_por_namespaces_disponible() {
+  # Chromium aísla sus procesos con namespaces de usuario sin privilegios. Si
+  # el kernel los permite, no hace falta el ayudante chrome-sandbox con bit
+  # setuid root. Tres interruptores distintos pueden cerrarlos.
+  local maximo_namespaces
+  maximo_namespaces="$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0)"
+  [ "${maximo_namespaces:-0}" -gt 0 ] || return 1
+
+  local userns_clone_permitido
+  userns_clone_permitido="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo 1)"
+  [ "$userns_clone_permitido" = "1" ] || return 1
+
+  # Ubuntu 24.04+ los restringe vía AppArmor aunque el sysctl los permita.
+  local apparmor_restringe
+  apparmor_restringe="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
+  [ "$apparmor_restringe" = "0" ] || return 1
+
+  return 0
+}
+
+paso_9_instalar_ficheros() {
+  paso "Instalación de ficheros"
+
+  # Preparo la versión nueva completa en un directorio aparte y solo al final
+  # la pongo en su sitio. Si algo falla por el camino, la instalación anterior
+  # sigue intacta en vez de quedarse a medias.
+  local staging="${PWD}/staging"
+  cp -a "${ORIGEN}/lib/claude-desktop" "$staging"
+  echo "$VERSION_DISPONIBLE" > "${staging}/${ARCHIVO_STAMP}"
+
+  if sandbox_por_namespaces_disponible; then
+    chmod 0755 "${staging}/chrome-sandbox"
+    ok "Sandbox por namespaces disponible → chrome-sandbox sin setuid"
+    detalle "Un binario setuid root menos en el sistema."
+  elif [ "$modo_sistema" = true ]; then
+    aviso "Namespaces de usuario restringidos → hace falta chrome-sandbox setuid"
+    NECESITA_SETUID_SANDBOX=true
+  else
+    aviso "Namespaces de usuario restringidos y estás en modo usuario."
+    detalle "El bit setuid necesita root: si la app no arranca, reinstala con --system"
+    detalle "o lánzala con --no-sandbox (menos seguro)."
+  fi
+
+  local destino_nuevo="${APP_DIR}.nuevo"
+  local destino_viejo="${APP_DIR}.viejo"
+
+  privilegiado rm -rf "$destino_nuevo" "$destino_viejo"
+  privilegiado mkdir -p "$(dirname "$APP_DIR")"
+  privilegiado cp -a "$staging" "$destino_nuevo"
+
+  if [ "$modo_sistema" = true ]; then
+    privilegiado chown -R root:root "$destino_nuevo"
+    if [ "${NECESITA_SETUID_SANDBOX:-false}" = true ]; then
+      privilegiado chown root:root "${destino_nuevo}/chrome-sandbox"
+      privilegiado chmod 4755 "${destino_nuevo}/chrome-sandbox"
+      ok "chrome-sandbox instalado setuid root (4755)"
+    fi
+  fi
+
+  # En una instalación limpia APP_DIR no existe todavía, así que esto va con
+  # 'if' y no con '&&': el test fallido dejaría la función devolviendo 1.
+  if [ -d "$APP_DIR" ]; then
+    privilegiado mv "$APP_DIR" "$destino_viejo"
+  fi
+  privilegiado mv "$destino_nuevo" "$APP_DIR"
+  privilegiado rm -rf "$destino_viejo"
+
+  ok "Instalado en $APP_DIR"
+}
+
+# ==============================================================================
+# PASO 10 — Integración de escritorio
+# ==============================================================================
+paso_10_integracion_escritorio() {
+  paso "Integración de escritorio"
+
+  privilegiado mkdir -p "$(dirname "$LAUNCHER")"
+  privilegiado ln -sfn "${APP_DIR}/claude-desktop" "$LAUNCHER"
+  ok "Ejecutable: $LAUNCHER"
+
+  # El .desktop oficial trae 'Exec=claude-desktop', que depende del PATH. Los
+  # lanzadores gráficos (rofi, dmenu-desktop, menús de escritorio) ejecutan ese
+  # Exec tal cual, y la sesión gráfica no hereda el PATH de tu shell
+  # interactiva: en modo usuario ~/.local/bin casi nunca está ahí. Con ruta
+  # absoluta funciona siempre, en cualquier lanzador.
+  privilegiado mkdir -p "$DIR_DESKTOP"
+  sed "s|^Exec=claude-desktop|Exec=${LAUNCHER}|" \
+    "${ORIGEN}/share/applications/${DESKTOP_FILE}" > "${PWD}/desktop-entry"
+  privilegiado cp "${PWD}/desktop-entry" "${DIR_DESKTOP}/${DESKTOP_FILE}"
+  privilegiado chmod 0644 "${DIR_DESKTOP}/${DESKTOP_FILE}"
+  ok "Entrada de menú con ruta absoluta en el Exec"
+
+  local tamano directorio_destino
+  for tamano in "${TAMANOS_ICONO[@]}"; do
+    directorio_destino="${DIR_ICONOS}/${tamano}x${tamano}/apps"
+    privilegiado mkdir -p "$directorio_destino"
+    privilegiado cp -f \
+      "${ORIGEN}/share/icons/hicolor/${tamano}x${tamano}/apps/claude-desktop.png" \
+      "${directorio_destino}/claude-desktop.png"
+  done
+  ok "Iconos instalados (${TAMANOS_ICONO[*]} px)"
+
+  command -v update-desktop-database >/dev/null \
+    && privilegiado update-desktop-database "$DIR_DESKTOP" 2>/dev/null || true
+  command -v gtk-update-icon-cache >/dev/null \
+    && privilegiado gtk-update-icon-cache -f -t "$DIR_ICONOS" 2>/dev/null || true
+
+  # En modo usuario el binario queda en ~/.local/bin, que en muchas distros no
+  # está en el PATH. Los lanzadores gráficos ya no dependen de eso (Exec
+  # absoluto), pero escribir 'claude-desktop' en una terminal sí.
+  #
+  # Con --prefix NO se toca el perfil: quien elige un prefijo a mano sabe lo
+  # que hace, y escribirle una línea de PATH hacia un directorio que puede ser
+  # temporal es peor que no hacer nada.
+  if [ "$prefijo_personalizado" = true ]; then
+    aviso "Prefijo personalizado: no toco tu ~/.profile"
+    detalle "Si quieres el comando en el PATH, añade a mano: ${PREFIJO}/bin"
+  elif [ "$modo_sistema" = false ]; then
+    case ":${PATH}:" in
+      *":${PREFIJO}/bin:"*) ok "${PREFIJO}/bin ya está en tu PATH" ;;
+      *)
+        local fichero_perfil="${HOME}/.profile"
+        # Hay que reconocer las DOS formas de escribir el mismo directorio: la
+        # expandida (/home/jason/.local/bin) y la que usa $HOME sin expandir.
+        # Buscar solo una de ellas duplica la línea en el perfil de quien ya
+        # tenía la otra.
+        local ruta_expandida="${PREFIJO}/bin"
+        local ruta_con_home="\$HOME${PREFIJO#"$HOME"}/bin"
+        if grep -qF "$ruta_expandida" "$fichero_perfil" 2>/dev/null \
+           || grep -qF "$ruta_con_home" "$fichero_perfil" 2>/dev/null; then
+          ok "PATH ya configurado en $fichero_perfil"
+        else
+          {
+            printf '\n# Añadido por claude-desktop-setup\n'
+            printf 'case ":$PATH:" in *":%s/bin:"*) ;; *) export PATH="%s/bin:$PATH" ;; esac\n' \
+              "$PREFIJO" "$PREFIJO"
+          } >> "$fichero_perfil"
+          ok "PATH añadido a $fichero_perfil"
+          detalle "Activo en tu próximo inicio de sesión, o con: source $fichero_perfil"
+        fi ;;
+    esac
+  fi
+}
+
+# ==============================================================================
+# PASO 11 — Diagnóstico del entorno
+# ==============================================================================
+paso_11_diagnostico() {
+  paso "Diagnóstico del entorno"
+
+  # --- Servidor gráfico -------------------------------------------------------
+  local tipo_sesion="${XDG_SESSION_TYPE:-desconocido}"
+  detalle "Sesión: $tipo_sesion   Escritorio: ${XDG_CURRENT_DESKTOP:-<sin definir>}"
+  if [ "$tipo_sesion" = "wayland" ]; then
+    aviso "En Wayland nativo, el atajo global de Quick Entry necesita el portal"
+    detalle "GlobalShortcuts de tu compositor. En X11 funciona directamente."
+  fi
+
+  # --- Llavero del sistema ----------------------------------------------------
+  # Sin Secret Service, la app avisa de que el login no se guardará y tendrás
+  # que autenticarte en cada arranque. Es el fallo típico en gestores de
+  # ventanas minimalistas (i3, sway, bspwm) sin entorno de escritorio completo.
+  if command -v busctl >/dev/null && busctl --user list 2>/dev/null | grep -q org.freedesktop.secrets; then
+    ok "Secret Service activo en el bus de sesión"
+
+    local coleccion_por_defecto
+    coleccion_por_defecto="$(busctl --user call org.freedesktop.secrets \
+      /org/freedesktop/secrets org.freedesktop.Secret.Service ReadAlias s default 2>/dev/null \
+      | grep -oE '/org/freedesktop/secrets/collection/[A-Za-z0-9_]+' || true)"
+
+    if [ -n "$coleccion_por_defecto" ]; then
+      local esta_bloqueada
+      esta_bloqueada="$(busctl --user get-property org.freedesktop.secrets \
+        "$coleccion_por_defecto" org.freedesktop.Secret.Collection Locked 2>/dev/null \
+        | awk '{print $2}')"
+      if [ "$esta_bloqueada" = "false" ]; then
+        ok "Llavero por defecto desbloqueado — el login persistirá"
+      else
+        aviso "El llavero por defecto está BLOQUEADO (Locked=$esta_bloqueada)"
+        detalle "Sin desbloquearlo, tendrás que iniciar sesión en cada arranque."
+        detalle "Normalmente lo abre pam_gnome_keyring al iniciar sesión;"
+        detalle "revisa que esté en /etc/pam.d/<tu-gestor-de-sesion>."
+      fi
+    else
+      aviso "No hay llavero marcado como 'default' en el Secret Service"
+    fi
+  else
+    aviso "NO hay Secret Service (org.freedesktop.secrets) en el bus de sesión"
+    detalle "La app avisará de que el login no se guarda. En Arch:"
+    detalle "  pacman -S gnome-keyring"
+    detalle "y arráncalo en tu sesión, p. ej. en la config de i3:"
+    detalle "  exec --no-startup-id /usr/bin/gnome-keyring-daemon --start --components=secrets"
+  fi
+
+  # --- Manejador del esquema claude:// ---------------------------------------
+  # El login abre el navegador y vuelve a la app con una URL claude://. Sin
+  # este manejador registrado, el navegador no sabe a quién devolverle el
+  # control y el inicio de sesión se queda a medias.
+  if command -v xdg-mime >/dev/null; then
+    local manejador
+    manejador="$(xdg-mime query default x-scheme-handler/claude 2>/dev/null || true)"
+    if [ "$manejador" = "$DESKTOP_FILE" ]; then
+      ok "Esquema claude:// registrado (necesario para volver del login)"
+    else
+      aviso "El esquema claude:// apunta a '${manejador:-nada}'"
+      detalle "Regístralo con: xdg-mime default $DESKTOP_FILE x-scheme-handler/claude"
+    fi
+  fi
+
+  # --- Extras opcionales ------------------------------------------------------
+  local extras_ausentes=()
+  command -v qemu-system-x86_64 >/dev/null || extras_ausentes+=("qemu-system-x86")
+  if [ ${#extras_ausentes[@]} -gt 0 ]; then
+    detalle "Opcional, no hace falta para arrancar: ${extras_ausentes[*]}"
+    detalle "(el .deb lo recomienda para el aislamiento en VM de Cowork)"
+  fi
+}
+
+# ==============================================================================
+# PASO 12 — Resumen
+# ==============================================================================
+paso_12_resumen() {
+  paso "Resumen"
+
+  local version_electron
+  version_electron="$(cat "${APP_DIR}/version" 2>/dev/null || echo "?")"
+
+  fila_resumen "Versión instalada" "$VERSION_DISPONIBLE"
+  fila_resumen "Electron"          "$version_electron"
+  fila_resumen "Aplicación"        "$APP_DIR"
+  fila_resumen "Ejecutable"        "$LAUNCHER"
+  fila_resumen "Entrada de menú"   "${DIR_DESKTOP}/${DESKTOP_FILE}"
+  fila_resumen "Tamaño"            "$(du -sh "$APP_DIR" | cut -f1)"
+
+  printf '\n%s✓ Listo.%s Ábrela desde tu lanzador buscando «Claude», o con: %s\n' \
+    "$C_OK" "$C_FIN" "$LAUNCHER"
+  printf '   Para actualizar en el futuro, vuelve a ejecutar este script.\n'
+
+  printf '\n   %sLo que el beta de Linux todavía no trae: Computer Use ni dictado por voz.%s\n' \
+    "$C_TENUE" "$C_FIN"
+
+  if [ "$abrir_al_terminar" = true ]; then
+    printf '\n   Abriendo Claude Desktop...\n'
+    setsid nohup "$LAUNCHER" >/dev/null 2>&1 < /dev/null &
+  fi
+}
+
+# ==============================================================================
+# Desinstalación
+# ==============================================================================
+desinstalar_todo() {
+  paso "Desinstalación"
+  [ -d "$APP_DIR" ] || fatal "no encuentro una instalación en $APP_DIR"
+
+  if pgrep -f "${APP_DIR}/claude-desktop" >/dev/null 2>&1; then
+    fatal "Claude Desktop está abierto. Ciérralo primero."
+  fi
+
+  privilegiado rm -rf "$APP_DIR"
+  privilegiado rm -f  "$LAUNCHER"
+  privilegiado rm -f  "${DIR_DESKTOP}/${DESKTOP_FILE}"
+  local tamano
+  for tamano in "${TAMANOS_ICONO[@]}"; do
+    privilegiado rm -f "${DIR_ICONOS}/${tamano}x${tamano}/apps/claude-desktop.png"
+  done
+  command -v update-desktop-database >/dev/null \
+    && privilegiado update-desktop-database "$DIR_DESKTOP" 2>/dev/null || true
+
+  ok "Desinstalado"
+  detalle "Tu configuración y sesión siguen en ~/.config/Claude (bórralo a mano si quieres)."
+  detalle "La línea del PATH en ~/.profile tampoco se toca."
+  exit 0
+}
+
+# ==============================================================================
+# Orquestación
+# ==============================================================================
+main() {
+  printf '%sClaude Desktop — instalador para distros sin apt%s\n' "$C_PASO" "$C_FIN"
+  printf '%sVerifica la firma GPG de Anthropic en cada paso de la cadena.%s\n' "$C_TENUE" "$C_FIN"
+
+  paso_1_comprobaciones
+  if [ "$desinstalar" = true ]; then
+    desinstalar_todo
+  fi
+
+  # Todo el trabajo sucio ocurre en un directorio temporal que se borra siempre,
+  # incluso si el script muere a mitad.
+  directorio_temporal="$(mktemp -d -t claude-desktop-setup-XXXXXX)"
+  trap 'rm -rf "$directorio_temporal"' EXIT
+  cd "$directorio_temporal"
+
+  paso_2_clave_de_firma
+  paso_3_indice_firmado
+  paso_4_lista_de_paquetes
+  paso_5_seleccionar_version
+  paso_6_descargar_paquete
+  paso_7_extraer
+  paso_8_comprobar_dependencias
+  paso_9_instalar_ficheros
+  paso_10_integracion_escritorio
+  paso_11_diagnostico
+  paso_12_resumen
+}
+
+main "$@"
